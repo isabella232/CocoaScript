@@ -290,6 +290,7 @@ JSValueRef _MOFunctionInvoke(id function, JSContextRef ctx, size_t argumentCount
     void* callAddress = NULL;
     NSUInteger callAddressArgumentCount = 0;
     BOOL variadic = NO;
+    unsigned int fixedArgumentCount = 0;
     
     id target = nil;
     SEL selector = NULL;
@@ -308,12 +309,15 @@ JSValueRef _MOFunctionInvoke(id function, JSContextRef ctx, size_t argumentCount
         target = [function target];
         selector = [function selector];
         Class klass = [target class];
-        
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
         // Override for Distributed Objects
         if ([klass isSubclassOfClass:[NSDistantObject class]]) {
             return MOSelectorInvoke(target, selector, ctx, argumentCount, arguments, exception);
         }
-        
+#pragma clang diagnostic pop
+
         // Override for Allocators
         if (selector == @selector(alloc)
             || selector == @selector(allocWithZone:))
@@ -385,6 +389,10 @@ JSValueRef _MOFunctionInvoke(id function, JSContextRef ctx, size_t argumentCount
                 // add an argument for NULL
                 argumentCount++;
             }
+            
+            // For variadic methods, we need to get the number of fixed arguments, before the first
+            // variadic one since that number needs to be passed to ffi_prep_cif_var below.
+            fixedArgumentCount = method_getNumberOfArguments(method);
         }
         
         if ((variadic && (callAddressArgumentCount > argumentCount))
@@ -590,7 +598,26 @@ JSValueRef _MOFunctionInvoke(id function, JSContextRef ctx, size_t argumentCount
     MOFunctionArgument *returnValue = [argumentEncodings objectAtIndex:0];
     
     // Prep
-    ffi_status prep_status = ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned int)effectiveArgumentCount, [returnValue ffiType], args);
+    ffi_status prep_status;
+
+    // If the method is variadic AND we could determine the number of fixed arguments, we need to
+    // take a special approach to prepare libffi to pass the arguments correctly.
+    // See https://github.com/sketch-hq/sketch/issues/35513
+    if (variadic && fixedArgumentCount > 0) {
+        if (@available(macOS 10.15, *)) {
+            // This is especially important on ARM Macs, since they require the variadic arguments to be
+            // passed on the stack, not in registers.
+            prep_status = ffi_prep_cif_var(&cif, FFI_DEFAULT_ABI, fixedArgumentCount, (unsigned int)effectiveArgumentCount, returnValue.ffiType, args);
+        } else {
+            // We should be safe to fall back to ffi_pref_cif here, because this only occurs on 10.14,
+            // which only runs on Intel, and on Intel we're using registers for variadic arguments.
+            prep_status = ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned int)effectiveArgumentCount, [returnValue ffiType], args);
+        }
+    } else {
+        // If a function is not variadic, libffi will do the correct thing in any case regardless
+        // of architecture.
+        prep_status = ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned int)effectiveArgumentCount, [returnValue ffiType], args);
+    }
     
     // Call
     if (prep_status == FFI_OK) {
@@ -937,6 +964,7 @@ NSString * MOPropertyNameToSetterName(NSString *propertyName) {
 #pragma mark Blocks
 
 typedef id (^MOJavaScriptClosureBlock)(id obj, ...);
+typedef id (^MOJavaScriptClosureWrapperBlock)(id obj, void *arg1, void *arg2, void *arg3, void *arg4, void *arg5, void *arg6, void *arg7, void *arg8, void *arg9, void *arg10, void *arg11, void *arg12);
 
 NSUInteger MOGetFunctionLength(MOJavaScriptObject *function) {
     JSObjectRef jsFunction = [function JSObject];
@@ -979,7 +1007,7 @@ id MOGetBlockForJavaScriptFunction(MOJavaScriptObject *function, NSUInteger *arg
             return nil;
         }
         
-        JSValueRef *jsArguments = (JSValueRef *)malloc(sizeof(JSValueRef) * (functionArgCount - 1));
+        JSValueRef *jsArguments = (JSValueRef *)malloc(sizeof(JSValueRef) * (functionArgCount));
         
         // Handle passed arguments
         for (NSUInteger i=0; i<functionArgCount; i++) {
@@ -1003,5 +1031,15 @@ id MOGetBlockForJavaScriptFunction(MOJavaScriptObject *function, NSUInteger *arg
         
         return (__bridge void*)returnValue;
     };
-    return [newBlock copy];
+    
+    // Because of the architectural differences between Intel and ARM, we're wrapping the variadic
+    // block above into one with a set number of parameters here.
+    //
+    // See also MSJSBlock.m and the void_invoke function for a longer explanation.
+    // See also https://github.com/sketch-hq/Sketch/issues/35324
+    MOJavaScriptClosureWrapperBlock wrapperBlock = (id)^(id obj, void *arg1, void *arg2, void *arg3, void *arg4, void *arg5, void *arg6, void *arg7, void *arg8, void *arg9, void *arg10, void *arg11, void *arg12) {
+        return newBlock(obj, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11, arg12);
+    };
+
+    return [wrapperBlock copy];
 }
